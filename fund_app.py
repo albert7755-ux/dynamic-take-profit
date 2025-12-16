@@ -9,30 +9,31 @@ st.set_page_config(page_title="動態鎖利投資回測系統", layout="wide")
 
 st.title("📊 動態鎖利 (母子基金) 投資架構回測")
 st.markdown("""
-本系統使用 **Yahoo Finance** 數據進行回測。
-* 台股代號請加上 `.TW` (例如: `0050.TW`, `2330.TW`)
-* 美股/ETF 直接輸入代號 (例如: `BND`, `QQQ`, `NVDA`)
-* 基金若有對應 ETF 建議優先使用 ETF 代號替代，數據較完整。
+**系統說明：**
+* 本系統使用 **Yahoo Finance** 數據。
+* **台股**請加 `.TW` (如 `0050.TW`)，**美股**直接輸入代號 (如 `QQQ`, `SPY`)。
+* 系統會自動將代號轉為大寫，並優先使用「還原權值 (Adj Close)」計算。
 """)
 
 # --- 側邊欄：參數設定 ---
 with st.sidebar:
-    st.header("1. 基金代號設定 (Yahoo Finance)")
+    st.header("1. 基金代號設定")
     
     # 母基金
     mom_ticker = st.text_input("母基金代號 (穩健型)", value="BND", help="例如: BND (總體債券), SHV (短債)")
     
     # 子基金 (支援最多3檔)
     st.markdown("---")
-    st.write("子基金 (積極型) - 最多可選 3 檔")
-    child_tickers = []
+    st.write("**子基金 (積極型) - 最多 3 檔**")
+    child_tickers_input = []
     c1 = st.text_input("子基金 1 代號", value="QQQ")
     c2 = st.text_input("子基金 2 代號 (選填)", value="")
     c3 = st.text_input("子基金 3 代號 (選填)", value="")
     
-    if c1: child_tickers.append(c1.upper())
-    if c2: child_tickers.append(c2.upper())
-    if c3: child_tickers.append(c3.upper())
+    # 收集有填寫的子基金
+    if c1: child_tickers_input.append(c1)
+    if c2: child_tickers_input.append(c2)
+    if c3: child_tickers_input.append(c3)
 
     # Benchmark
     st.markdown("---")
@@ -60,31 +61,70 @@ with st.sidebar:
     start_date = st.date_input("回測開始日期", value=datetime(2021, 1, 1))
     end_date = st.date_input("回測結束日期", value=datetime.today())
 
-# --- 核心邏輯函數 ---
+# --- 核心邏輯函數 (修復版) ---
 def get_data(tickers, start, end):
-    """下載數據並清理"""
+    """
+    下載數據並清理 (增強容錯能力)
+    """
     if not tickers:
         return pd.DataFrame()
+    
+    # 1. 強制轉大寫並去空白 (解決 spy vs SPY)
+    clean_tickers = [t.upper().strip() for t in tickers]
+    
     try:
-        # 下載調整後收盤價
-        data = yf.download(tickers, start=start, end=end, progress=False)['Adj Close']
+        # 2. 下載數據
+        # auto_adjust=False 確保我們能明確看到 'Adj Close'，防止新版 yfinance 自動調整欄位
+        raw_data = yf.download(clean_tickers, start=start, end=end, progress=False, auto_adjust=False)
         
-        # 處理單一 ticker 返回 Series 的情況，統一轉為 DataFrame
-        if isinstance(data, pd.Series):
-            data = data.to_frame(name=tickers[0])
+        if raw_data.empty:
+            st.error(f"⚠️ 下載數據為空！請檢查代號 {clean_tickers} 是否正確，或日期區間是否有交易資料。")
+            return pd.DataFrame()
+
+        # 3. 處理價格欄位
+        # yfinance 回傳格式可能是 MultiIndex ('Adj Close', 'BND') 或單層 Index
+        target_col = 'Adj Close'
+        
+        # 檢查是否存在 'Adj Close'
+        if target_col not in raw_data.columns:
+            if 'Close' in raw_data.columns:
+                # st.warning("提示: 找不到 'Adj Close' (還原權值)，系統將改用 'Close' 進行計算。")
+                target_col = 'Close'
+            else:
+                st.error(f"⚠️ 數據格式異常，找不到價格欄位。下載到的欄位: {raw_data.columns}")
+                return pd.DataFrame()
+
+        df_prices = raw_data[target_col]
+
+        # 4. 格式統一化
+        # 如果只下載單一檔股票，df_prices 會是 Series，必須轉成 DataFrame
+        if isinstance(df_prices, pd.Series):
+            df_prices = df_prices.to_frame(name=clean_tickers[0])
             
-        # 處理 MultiIndex (如果有的話)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+        # 再次確保所有需要的代號都在 Columns 裡
+        # 有時候 yfinance 下載多檔若其中一檔失敗，該欄位會消失
+        missing_cols = [t for t in clean_tickers if t not in df_prices.columns]
+        if missing_cols:
+            st.warning(f"⚠️ 以下代號無法取得數據，將被忽略: {missing_cols}")
             
-        return data.ffill().dropna() # 填補假日並刪除空值
+        return df_prices.ffill().dropna() # 填補假日並刪除空值
+
     except Exception as e:
-        st.error(f"數據下載發生錯誤: {e}")
+        st.error(f"數據下載發生嚴重錯誤: {e}")
         return pd.DataFrame()
 
 def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t_days, target):
+    # 確保所有代號都是大寫，以匹配 DataFrame 的欄位
+    mom_tick = mom_tick.upper().strip()
+    child_ticks = [t.upper().strip() for t in child_ticks if t.upper().strip() in df.columns]
+    bench_tick = bench_tick.upper().strip()
+
+    if mom_tick not in df.columns or bench_tick not in df.columns:
+        st.error("錯誤: 母基金或 Benchmark 數據缺失，無法回測。")
+        return pd.DataFrame(), False
+
     # 1. 初始配置
-    # 扣除手續費 (假設手續費內扣，實際投入母基金金額變少)
+    # 扣除手續費 (模擬真實進場金額)
     entry_fee_amount = capital * fee
     net_capital = capital - entry_fee_amount
     
@@ -95,7 +135,7 @@ def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t
     # 子基金單位數初始化 (字典)
     child_units = {t: 0.0 for t in child_ticks}
     
-    # Benchmark 單位數 (假設單筆買進持有，不做任何操作，含手續費比較公平)
+    # Benchmark 單位數 (假設單筆買進持有)
     bench_price_init = df[bench_tick].iloc[0]
     bench_units = net_capital / bench_price_init
     
@@ -119,7 +159,7 @@ def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t
         total_val = mom_val + child_val_total
         bench_val = bench_units * row[bench_tick]
         
-        # 計算報酬率 (分母用原始本金 30萬)
+        # 計算報酬率 (分母用原始本金，包含已付出的手續費)
         roi = (total_val - capital) / capital
         
         action = "Hold"
@@ -128,7 +168,7 @@ def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t
         if roi >= target:
             action = "★ Stop Profit"
             triggered = True
-            records.append({
+            rec = {
                 "Date": date,
                 "Total Value": total_val,
                 "Mom Value": mom_val,
@@ -136,19 +176,20 @@ def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t
                 "Benchmark Value": bench_val,
                 "ROI": roi,
                 "Action": action
-            })
+            }
+            for t in child_ticks: rec[f"Val_{t}"] = child_vals[t]
+            records.append(rec)
             break # 終止回測
             
         # --- C. 執行轉申購 (若未停利) ---
         if date.day in t_days:
-            # 依序檢查每個子基金
             transferred_any = False
             for t in child_ticks:
                 if mom_val >= t_amt:
                     # 母基金贖回
                     units_out = t_amt / mom_price
                     mom_units -= units_out
-                    mom_val -= t_amt # 更新暫存市值以便下一個迴圈判斷
+                    mom_val -= t_amt # 更新暫存市值
                     
                     # 子基金申購
                     child_price = row[t]
@@ -156,9 +197,8 @@ def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t
                     child_units[t] += units_in
                     transferred_any = True
                 else:
-                    # 母基金餘額不足，停止該檔及後續轉換 (依規範)
                     action = "Insufficient Funds"
-                    break
+                    break # 餘額不足停止後續轉換
             
             if transferred_any:
                 action = "Transfer"
@@ -173,7 +213,6 @@ def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t
             "ROI": roi,
             "Action": action
         }
-        # 加入個別子基金市值
         for t in child_ticks:
             rec[f"Val_{t}"] = child_vals[t]
             
@@ -183,76 +222,81 @@ def run_simulation(df, mom_tick, child_ticks, bench_tick, capital, fee, t_amt, t
 
 # --- 主程式執行區 ---
 if st.button("🚀 開始回測", type="primary"):
-    if not child_tickers:
+    # 檢查是否輸入了子基金
+    if not child_tickers_input:
         st.error("請至少輸入一檔子基金代號！")
     else:
         # 準備下載清單
-        all_tickers = [mom_ticker] + child_tickers + [benchmark_ticker]
+        all_tickers = [mom_ticker] + child_tickers_input + [benchmark_ticker]
         
         with st.spinner('正在從 Yahoo Finance 下載數據並運算中...'):
             df_data = get_data(all_tickers, start_date, end_date)
             
-            if df_data.empty or df_data.shape[1] < len(all_tickers):
-                st.error("數據下載不完整，請檢查代號是否正確 (台股需加 .TW) 或日期範圍。")
-                st.write("嘗試下載的代號:", all_tickers)
-            else:
+            # 檢查數據是否足夠進行運算
+            if not df_data.empty:
                 # 執行回測
                 res_df, is_win = run_simulation(
-                    df_data, mom_ticker, child_tickers, benchmark_ticker,
+                    df_data, mom_ticker, child_tickers_input, benchmark_ticker,
                     initial_capital, fee_rate, transfer_amount, transfer_days, target_roi
                 )
                 
-                # --- 結果顯示 ---
-                # 1. KPI 指標
-                st.markdown("### 📊 回測結果摘要")
-                col1, col2, col3, col4 = st.columns(4)
-                
-                last_row = res_df.iloc[-1]
-                final_roi = last_row['ROI']
-                bench_roi = (last_row['Benchmark Value'] - initial_capital) / initial_capital
-                days_run = (last_row['Date'] - res_df.iloc[0]['Date']).days
-                
-                col1.metric("最終資產總值", f"${last_row['Total Value']:,.0f}")
-                col2.metric("策略報酬率 (ROI)", f"{final_roi*100:.2f}%", 
-                            delta=f"{(final_roi - bench_roi)*100:.2f}% vs Benchmark")
-                col3.metric("母基金剩餘金額", f"${last_row['Mom Value']:,.0f}")
-                col4.metric("狀態", "✅ 獲利達標出場" if is_win else "⏳ 尚未達標/持續運作")
+                if res_df.empty:
+                    st.error("回測運算失敗，可能因數據不足或代號錯誤。")
+                else:
+                    # --- 結果顯示 ---
+                    # 1. KPI 指標
+                    st.markdown("### 📊 回測結果摘要")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    last_row = res_df.iloc[-1]
+                    final_roi = last_row['ROI']
+                    bench_roi = (last_row['Benchmark Value'] - initial_capital) / initial_capital
+                    
+                    col1.metric("最終資產總值", f"${last_row['Total Value']:,.0f}")
+                    col2.metric("策略報酬率 (ROI)", f"{final_roi*100:.2f}%", 
+                                delta=f"{(final_roi - bench_roi)*100:.2f}% vs Benchmark")
+                    col3.metric("母基金剩餘金額", f"${last_row['Mom Value']:,.0f}")
+                    col4.metric("狀態", "✅ 獲利達標出場" if is_win else "⏳ 尚未達標/持續運作")
 
-                # 2. 互動圖表
-                st.subheader("📈 資產走勢圖")
-                fig = go.Figure()
-                
-                # 總資產
-                fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df['Total Value'], 
-                                         name='總資產 (母+子)', line=dict(color='red', width=3)))
-                # Benchmark
-                fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df['Benchmark Value'], 
-                                         name=f'Benchmark ({benchmark_ticker})', 
-                                         line=dict(color='gray', dash='dot')))
-                # 母基金
-                fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df['Mom Value'], 
-                                         name=f'母基金 ({mom_ticker})', 
-                                         line=dict(color='blue', width=1), fill='tozeroy', fillcolor='rgba(0,0,255,0.1)'))
-                
-                # 個別子基金
-                for t in child_tickers:
-                    fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df[f"Val_{t}"], 
-                                             name=f'子基金 ({t})', visible='legendonly'))
+                    # 2. 互動圖表
+                    st.subheader("📈 資產走勢圖")
+                    fig = go.Figure()
+                    
+                    # 總資產
+                    fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df['Total Value'], 
+                                             name='總資產 (母+子)', line=dict(color='red', width=3)))
+                    # Benchmark
+                    fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df['Benchmark Value'], 
+                                             name=f'Benchmark ({benchmark_ticker.upper()})', 
+                                             line=dict(color='gray', dash='dot')))
+                    # 母基金
+                    fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df['Mom Value'], 
+                                             name=f'母基金 ({mom_ticker.upper()})', 
+                                             line=dict(color='blue', width=1), fill='tozeroy', fillcolor='rgba(0,0,255,0.1)'))
+                    
+                    # 個別子基金
+                    for t in child_tickers_input:
+                        t_upper = t.upper().strip()
+                        if f"Val_{t_upper}" in res_df.columns:
+                            fig.add_trace(go.Scatter(x=res_df['Date'], y=res_df[f"Val_{t_upper}"], 
+                                                     name=f'子基金 ({t_upper})', visible='legendonly'))
 
-                # 標記停利點
-                if is_win:
-                    fig.add_annotation(x=last_row['Date'], y=last_row['Total Value'],
-                                       text="🎉 停利出場", showarrow=True, arrowhead=2, ax=0, ay=-40)
+                    # 標記停利點
+                    if is_win:
+                        fig.add_annotation(x=last_row['Date'], y=last_row['Total Value'],
+                                           text="🎉 停利出場", showarrow=True, arrowhead=2, ax=0, ay=-40)
 
-                fig.update_layout(height=500, hovermode="x unified")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # 3. 數據表格
-                with st.expander("查看詳細交易數據"):
-                    st.dataframe(res_df.style.format({
-                        "Total Value": "{:,.0f}",
-                        "Mom Value": "{:,.0f}",
-                        "Child Total": "{:,.0f}",
-                        "Benchmark Value": "{:,.0f}",
-                        "ROI": "{:.2%}"
-                    }))
+                    fig.update_layout(height=500, hovermode="x unified")
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # 3. 數據表格
+                    with st.expander("查看詳細交易數據"):
+                        st.dataframe(res_df.style.format({
+                            "Total Value": "{:,.0f}",
+                            "Mom Value": "{:,.0f}",
+                            "Child Total": "{:,.0f}",
+                            "Benchmark Value": "{:,.0f}",
+                            "ROI": "{:.2%}"
+                        }))
+            else:
+                st.error("無法取得數據，請重新檢查代號或網路連線。")
