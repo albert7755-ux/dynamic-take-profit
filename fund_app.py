@@ -7,7 +7,7 @@ from datetime import datetime, date
 # --- 頁面設定 ---
 st.set_page_config(page_title="動態鎖利投資回測系統", layout="wide")
 
-# --- 初始化 Session State (確保按鈕點擊後狀態保留) ---
+# --- 初始化 Session State ---
 if 'run_analysis' not in st.session_state:
     st.session_state.run_analysis = False
 if 'data_cache' not in st.session_state:
@@ -16,11 +16,11 @@ if 'data_cache' not in st.session_state:
 st.title("📊 動態鎖利 (母子基金) 綜合回測系統")
 st.markdown("""
 本系統提供兩種視角：
-1. **單次進出詳細分析**：檢視單筆資金投入後的詳細運作軌跡 (日期由側邊欄設定)。
-2. **循環鎖利分析**：檢視長期重複執行此策略的累積成果 (**自動抓取最早可回測日期**)。
+1. **單次進出詳細分析**：檢視單筆資金投入後的詳細運作軌跡。
+2. **循環鎖利分析**：檢視長期重複執行此策略的累積成果 (**可排除 2022 極端行情**)。
 """)
 
-# --- 側邊欄：全域與單次設定 ---
+# --- 側邊欄：設定 ---
 with st.sidebar:
     st.header("1. 基金代號設定")
     mom_ticker = st.text_input("母基金代號 (穩健型)", value="BND")
@@ -52,7 +52,6 @@ with st.sidebar:
     target_roi = target_roi_percent / 100
     
     st.header("5. 單次分析日期 (Tab 1)")
-    # 單次分析通常比較短期，這裡保留手動設定
     start_date = st.date_input("單次-開始日期", value=datetime(2021, 1, 1))
     end_date = st.date_input("單次-結束日期", value=datetime.today())
 
@@ -61,19 +60,14 @@ def get_data(tickers, start, end):
     if not tickers: return pd.DataFrame()
     clean_tickers = [t.upper().strip() for t in tickers]
     try:
-        # 下載數據
         raw = yf.download(clean_tickers, start=start, end=end, progress=False, auto_adjust=False)
         if raw.empty: return pd.DataFrame()
         
-        # 處理欄位
         target_col = 'Adj Close' if 'Adj Close' in raw.columns else 'Close'
         if target_col not in raw.columns: return pd.DataFrame()
         
         df = raw[target_col]
         if isinstance(df, pd.Series): df = df.to_frame(name=clean_tickers[0])
-        
-        # 關鍵：刪除空值，這會自動切除「某檔基金還沒上市」的前段時間
-        # 例如：母基金2007上市，子基金2019上市，dropna後數據會從2019開始
         return df.ffill().dropna()
     except: return pd.DataFrame()
 
@@ -81,19 +75,16 @@ def get_data(tickers, start, end):
 def run_single_simulation(df, mom_tick, child_ticks, capital, t_amt, t_days, target):
     mom_tick = mom_tick.upper().strip()
     child_ticks = [t.upper().strip() for t in child_ticks if t.upper().strip() in df.columns]
-    
     if mom_tick not in df.columns: return pd.DataFrame(), False
 
     mom_units = capital / df[mom_tick].iloc[0]
     child_units = {t: 0.0 for t in child_ticks}
-    
     records = []
     triggered = False
     
     for date_idx, row in df.iterrows():
         mom_price = row[mom_tick]
         mom_val = mom_units * mom_price
-        
         child_val_total = 0
         child_vals = {}
         for t in child_ticks:
@@ -127,19 +118,16 @@ def run_single_simulation(df, mom_tick, child_ticks, capital, t_amt, t_days, tar
         rec = {"Date": date_idx, "Total Value": total_val, "Mom Value": mom_val, "Child Total": child_val_total, "ROI": roi, "Action": action}
         for t in child_ticks: rec[f"Val_{t}"] = child_vals[t]
         records.append(rec)
-        
     return pd.DataFrame(records), triggered
 
 # --- 邏輯 B: 循環回測 ---
 def run_continuous_simulation(df, mom_tick, child_ticks, capital, t_amt, t_days, target):
     mom_tick = mom_tick.upper().strip()
     child_ticks = [t.upper().strip() for t in child_ticks if t.upper().strip() in df.columns]
-    
     if mom_tick not in df.columns: return pd.DataFrame(), {}, []
 
     mom_units = 0.0
     child_units = {t: 0.0 for t in child_ticks}
-    
     records = []
     completed_rounds = []
     is_running = False
@@ -196,45 +184,34 @@ def run_continuous_simulation(df, mom_tick, child_ticks, capital, t_amt, t_days,
 # --- 按鈕觸發區 ---
 if st.button("🚀 開始分析", type="primary"):
     st.session_state.run_analysis = True
-    # 按下按鈕時，我們從 2000 年開始抓，讓系統自己去 dropna 找出真正的起始日
-    # 這樣就不用怕使用者不知道該基金哪天成立
     all_tickers = [mom_ticker] + child_tickers_input
-    
     with st.spinner('正在從 Yahoo Finance 下載完整歷史數據...'):
-        # 這裡 hardcode 從 2000 年開始，確保抓到所有可用的歷史資料
         df_downloaded = get_data(all_tickers, "2000-01-01", datetime.today())
         st.session_state.data_cache = df_downloaded
 
-# --- 顯示區塊 (依據 Session State 決定是否顯示) ---
+# --- 顯示區塊 ---
 if st.session_state.run_analysis:
     df_data = st.session_state.data_cache
     
     if df_data.empty:
         st.error("❌ 無法取得數據，請檢查代號是否正確。")
     else:
-        # 取得數據真正的第一天 (所有基金都有資料的那天)
         actual_start_date = df_data.index[0].date()
         max_end_date = df_data.index[-1].date()
-
-        # 建立分頁
         tab1, tab2 = st.tabs(["📄 單次進出詳細分析", "🔄 循環鎖利分析"])
         
-        # --- Tab 1: 單次邏輯 ---
+        # --- Tab 1 ---
         with tab1:
-            # 根據側邊欄的日期進行過濾
             df_single_slice = df_data[start_date:end_date]
-            
             if df_single_slice.empty:
-                st.warning("⚠️ 側邊欄設定的「單次分析日期」範圍內無資料。")
+                st.warning("⚠️ 日期範圍內無資料。")
             else:
                 df_single, is_win = run_single_simulation(
                     df_single_slice, mom_ticker, child_tickers_input, initial_capital, transfer_amount, transfer_days, target_roi
                 )
-                
                 if not df_single.empty:
                     last_row = df_single.iloc[-1]
                     final_roi = last_row['ROI']
-                    
                     if is_win:
                         st.success(f"### 🎉 獲利達標 (單次模式) \n於 **{last_row['Date'].strftime('%Y-%m-%d')}** 觸發停利，報酬率 **{final_roi*100:.2f}%**")
                     else:
@@ -242,7 +219,7 @@ if st.session_state.run_analysis:
                     
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("進場日期", df_single.iloc[0]['Date'].strftime('%Y-%m-%d'))
-                    c2.metric("出場/結算日期", last_row['Date'].strftime('%Y-%m-%d'))
+                    c2.metric("出場/結算", last_row['Date'].strftime('%Y-%m-%d'))
                     c3.metric("最終資產", f"${last_row['Total Value']:,.0f}")
                     c4.metric("ROI", f"{final_roi*100:.2f}%", delta_color="normal" if final_roi>=0 else "inverse")
                     
@@ -255,20 +232,26 @@ if st.session_state.run_analysis:
                     with st.expander("查看單次詳細交易數據", expanded=True):
                         st.dataframe(df_single.style.format({"Total Value": "{:,.0f}", "Mom Value": "{:,.0f}", "Child Total": "{:,.0f}", "ROI": "{:.2%}"}))
 
-        # --- Tab 2: 循環邏輯 (自動對齊日期) ---
+        # --- Tab 2: 循環邏輯 (含排除 2022 功能) ---
         with tab2:
-            st.markdown("#### 📅 循環回測統計區間")
-            st.caption(f"💡 系統偵測到您選擇的投資組合，最早共同可回測日期為： **{actual_start_date}**")
+            st.markdown("#### 📅 循環回測設定")
             
-            col_d1, col_d2 = st.columns(2)
+            # 排版：左邊日期，右邊排除選項
+            col_d1, col_d2, col_opt = st.columns([1, 1, 1.5])
             
-            # 使用 actual_start_date 作為預設值 (value) 和最小值 (min_value)
-            # 這樣使用者一進來看到的就是真正有資料的那天
             start_date_circ = col_d1.date_input("開始日", value=actual_start_date, min_value=actual_start_date, max_value=max_end_date, key="circ_start")
             end_date_circ = col_d2.date_input("結束日", value=max_end_date, min_value=actual_start_date, max_value=max_end_date, key="circ_end")
+            
+            # [新增] 排除 2022 的開關
+            exclude_2022 = col_opt.checkbox("排除 2022 年數據 (模擬極端熊市未發生)", value=False)
 
-            # 根據 Tab2 選擇的日期切割數據
+            # 數據過濾邏輯
             df_circ_slice = df_data[start_date_circ:end_date_circ]
+            
+            if exclude_2022:
+                # 移除 2022 年的所有資料列
+                df_circ_slice = df_circ_slice[df_circ_slice.index.year != 2022]
+                st.caption("ℹ️ 已啟用過濾：2022 年度的交易日已從回測中剔除，平均歷時將不包含該年度之天數。")
 
             if not df_circ_slice.empty:
                 df_cont, stats, rounds = run_continuous_simulation(
@@ -278,6 +261,7 @@ if st.session_state.run_analysis:
                 st.markdown("### 🏆 策略總覽")
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("累積成功出場", f"{stats['Total Rounds']} 次")
+                # 這裡的歷時會因為排除了 2022 而變短，這正是您要的效果
                 k2.metric("平均每一趟歷時", f"{stats['Avg Duration']:.1f} 天")
                 k3.metric("累積獲利金額", f"${stats['Total Profit']:,.0f}")
                 
@@ -293,7 +277,12 @@ if st.session_state.run_analysis:
                 exits = df_cont[df_cont['Action'] == '★ Stop Profit']
                 fig_c.add_trace(go.Scatter(x=exits['Date'], y=exits['Total Value'], mode='markers', name='停利點', marker=dict(size=10, color='red', symbol='star')))
                 fig_c.add_hline(y=initial_capital, line_dash="dash", line_color="gray", annotation_text="本金線")
-                fig_c.update_layout(height=450, hovermode="x unified", title=f"循環獲利示意圖 (累積獲利: ${stats['Total Profit']:,.0f})")
+                
+                # 若排除 2022，圖表上會出現日期跳躍，這是正常的
+                chart_title = f"循環獲利示意圖 (累積獲利: ${stats['Total Profit']:,.0f})"
+                if exclude_2022: chart_title += " [不含 2022]"
+                
+                fig_c.update_layout(height=450, hovermode="x unified", title=chart_title)
                 st.plotly_chart(fig_c, use_container_width=True)
                 
                 if rounds:
@@ -315,7 +304,6 @@ st.warning("""
 **⚠️ 警語 / Disclaimer**：
 1. 本系統之回測結果僅供參考，**過去之績效不代表未來投資之保證**。
 2. 投資一定有風險，基金投資有賺有賠，申購前應詳閱公開說明書。
-3. 動態鎖利/母子基金機制並非保本商品，在市場發生極端行情時，母基金仍可能面臨淨值下跌或本金虧損之風險。
-4. 實際交易之手續費、管理費等成本可能依銀行規定而有所不同，本回測未完全涵蓋所有潛在成本。
-5. 數據資料來源：Yahoo Finance
+3. 若勾選「排除 2022 年」，回測結果將不包含該年度之市場波動與持有時間，僅供壓力測試與情境分析使用，非真實歷史績效。
+4. 數據資料來源：Yahoo Finance
 """)
